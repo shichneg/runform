@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>跑步姿勢即時教練</title>
+<style>
+  /* ===== 版面：手機橫放時，左邊影像、右邊數據 ===== */
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+         background: #111; color: #eee; }
+  header { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 8px; background: #1c1c1c; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; }
+  button, select, input { font-size: 14px; border-radius: 8px; border: 1px solid #444; background: #2a2a2a;
+                          color: #eee; padding: 6px 10px; }
+  button.primary { background: #1f7a3a; border-color: #1f7a3a; font-weight: bold; }
+  button.stop { background: #a32b2b; border-color: #a32b2b; }
+  button.on { background: #24508f; border-color: #24508f; }
+  input[type=number] { width: 64px; }
+  #main { display: flex; gap: 8px; padding: 8px; }
+  #stage { position: relative; flex: 1 1 60%; background: #000; border-radius: 8px; overflow: hidden; min-height: 240px; }
+  #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #hint { position: absolute; left: 8px; bottom: 8px; background: rgba(0,0,0,.6); padding: 4px 8px;
+          border-radius: 6px; font-size: 13px; }
+  #panel { flex: 0 0 260px; display: flex; flex-direction: column; gap: 6px; }
+  #bigCad { font-size: 40px; font-weight: bold; text-align: center; line-height: 1.1; }
+  #bigCad small { font-size: 14px; font-weight: normal; color: #aaa; display: block; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 5px 8px;
+         background: #1c1c1c; border-radius: 6px; font-size: 14px; }
+  .dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; background: #555; }
+  .ok .dot { background: #2ecc71; } .warn .dot { background: #e74c3c; } .warn { color: #ffb3a7; }
+  #cueBox { background: #2b2410; color: #ffd76a; padding: 8px; border-radius: 6px; min-height: 40px; font-size: 15px; }
+  #report, #history { margin: 8px; padding: 10px; background: #1c1c1c; border-radius: 8px; display: none; }
+  #report h2, #history h2 { font-size: 17px; margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  td { padding: 4px 6px; border-bottom: 1px solid #333; }
+  .note { color: #999; font-size: 12px; }
+  a { color: #7fb7ff; }
+  @media (orientation: portrait) {   /* 直放手機：改成上下排列 */
+    #main { flex-direction: column; }
+    #panel { flex: none; }
+    #stage { min-height: 56vw; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🏃 跑步姿勢即時教練</h1>
+  <button id="btnStart" class="primary" disabled>載入中…</button>
+  <button id="btnMetro">節拍器：關</button>
+  <label>目標 <input id="targetCad" type="number" min="120" max="220" value="170"> 步/分</label>
+  <button id="btnAutoTarget" title="用目前步頻 +5% 當目標">自動目標</button>
+  <button id="btnVoice" class="on">語音：開</button>
+  <button id="btnRec">錄影：關</button>
+  <button id="btnCam">切換鏡頭</button>
+  <button id="btnHistory">歷次紀錄</button>
+</header>
+
+<div id="main">
+  <div id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div id="hint">請把手機橫放、固定在跑步機正側面，拍到全身</div>
+  </div>
+  <div id="panel">
+    <div id="bigCad">--<small>步頻（步/分）</small></div>
+    <div id="rows"></div>
+    <div id="cueBox">語音提示會顯示在這裡</div>
+    <div class="note">⚠ 數值為單一鏡頭估計，僅供參考，不是醫療建議。膝蓋已有疼痛或傷病請先諮詢醫師或物理治療師。</div>
+  </div>
+</div>
+
+<div id="report"></div>
+<div id="history"></div>
+
+<script type="module">
+// ============================================================
+// 一、載入套件
+// ============================================================
+// MediaPipe 網頁版（從 CDN 載入，固定版本號避免哪天更新後壞掉）
+import { PoseLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3/vision_bundle.mjs";
+// 我們自己寫的分析核心
+import { RunAnalyzer, METRICS } from "./analyzer.js";
+
+const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3/wasm";
+// lite 模型比較快，適合手機即時；想要更準可以把 lite 改成 full（兩處都要改）
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/" +
+                  "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task";
+
+// 骨架要畫的點（MediaPipe 編號，左右各一組）
+const SIDE_IDS = {
+  left:  { ear: 7, shoulder: 11, elbow: 13, wrist: 15, hip: 23, knee: 25, ankle: 27, heel: 29, toe: 31 },
+  right: { ear: 8, shoulder: 12, elbow: 14, wrist: 16, hip: 24, knee: 26, ankle: 28, heel: 30, toe: 32 },
+};
+// 每一段骨頭對應哪幾個檢查項目（有任何一項 warn 就畫紅色）
+const BONES = [
+  ["ear", "shoulder", ["headForward"]],
+  ["shoulder", "hip", ["trunkLean"]],
+  ["shoulder", "elbow", ["elbow"]],
+  ["elbow", "wrist", ["elbow"]],
+  ["hip", "knee", ["hipExt", "bounce"]],
+  ["knee", "ankle", ["kneeFlex", "overstride"]],
+  ["ankle", "heel", ["overstride", "cadence"]],
+  ["heel", "toe", ["overstride", "cadence"]],
+];
+
+// ============================================================
+// 二、畫面元件與狀態
+// ============================================================
+const $ = (id) => document.getElementById(id);
+const video = $("video"), canvas = $("canvas"), ctx = canvas.getContext("2d");
+
+let landmarker = null;        // MediaPipe 偵測器
+let stream = null;            // 鏡頭串流
+let facing = "environment";   // environment = 後鏡頭；user = 前鏡頭
+let running = false;          // 是否正在記錄這一次跑步
+let voiceOn = true, metroOn = false, recOn = false;
+let lastVideoTime = -1;
+let lastEvals = [];
+let lastContactCount = 0, flashUntil = 0;
+const analyzer = new RunAnalyzer();
+
+// 右側的各部位燈號列
+$("rows").innerHTML = METRICS.map((m) =>
+  `<div class="row" id="row_${m.key}"><span><span class="dot"></span>${m.part}</span><span class="val">--</span></div>`
+).join("");
+
+// ============================================================
+// 三、啟動：載入模型、打開鏡頭
+// ============================================================
+async function init() {
+  try {
+    const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+    const makeOpts = (delegate) => ({
+      baseOptions: { modelAssetPath: MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numPoses: 1,
+    });
+    try {
+      landmarker = await PoseLandmarker.createFromOptions(fileset, makeOpts("GPU"));
+    } catch (e) {
+      // 有些手機不支援 GPU，改用 CPU
+      landmarker = await PoseLandmarker.createFromOptions(fileset, makeOpts("CPU"));
+    }
+    await openCamera();
+    $("btnStart").disabled = false;
+    $("btnStart").textContent = "開始跑步";
+    requestAnimationFrame(loop);
+  } catch (e) {
+    $("btnStart").textContent = "載入失敗";
+    $("hint").textContent = "載入失敗：" + e.message + "（需要 HTTPS 網址，並允許使用相機）";
+    console.error(e);
+  }
+}
+
+async function openCamera() {
+  // 瀏覽器只在 HTTPS（或電腦本機 localhost）網址才允許使用相機
+  if (!navigator.mediaDevices) throw new Error("這個網址無法使用相機，請改用 https:// 開頭的網址");
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+// ============================================================
+// 四、主迴圈：每一幀偵測關節點 → 分析 → 畫圖
+// ============================================================
+function loop() {
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const nowMs = performance.now();
+    const result = landmarker.detectForVideo(video, nowMs);
+    const lms = result.landmarks && result.landmarks[0] ? result.landmarks[0] : null;
+    const w = video.videoWidth, h = video.videoHeight;
+    const t = nowMs / 1000;
+
+    if (running) {
+      analyzer.addFrame(lms, t, w, h);
+      lastEvals = analyzer.evaluate(analyzer.getMetrics(t));
+      updatePanel(lastEvals);
+      // 有新的著地 → 畫面閃一下提示
+      if (analyzer.contacts.length > lastContactCount) {
+        lastContactCount = analyzer.contacts.length;
+        flashUntil = t + 0.15;
+      }
+      const cue = analyzer.pickCue(t, lastEvals);
+      if (cue) say(cue);
+    }
+    draw(lms, w, h, t);
+  }
+  requestAnimationFrame(loop);
+}
+
+// ============================================================
+// 五、畫骨架：有問題的部位畫紅色
+// ============================================================
+function draw(lms, w, h, t) {
+  if (canvas.width !== w) { canvas.width = w; canvas.height = h; }
+  ctx.clearRect(0, 0, w, h);
+  if (!lms) { $("hint").textContent = "沒有偵測到人，請站進畫面"; return; }
+
+  // 入鏡檢查：肩膀到腳都要在畫面內
+  const inFrame = [11, 12, 27, 28].every((i) => lms[i].y > 0.02 && lms[i].y < 0.98);
+  if (!running) $("hint").textContent = inFrame ? "✓ 全身入鏡，可以開始" : "請退後一點，讓頭到腳都入鏡";
+
+  // 分析哪一隻腳：跑步中用分析器鎖定的那隻，沒開始前用可見度比較高的那隻
+  const side = analyzer.side ||
+    ((lms[27].visibility ?? 1) >= (lms[28].visibility ?? 1) ? "left" : "right");
+  const P = {};
+  for (const [name, id] of Object.entries(SIDE_IDS[side])) P[name] = [lms[id].x * w, lms[id].y * h];
+
+  const warnKeys = new Set(lastEvals.filter((e) => e.status === "warn").map((e) => e.key));
+  ctx.lineWidth = Math.max(4, w / 200);
+  ctx.lineCap = "round";
+  for (const [a, b, keys] of BONES) {
+    const bad = running && keys.some((k) => warnKeys.has(k));
+    ctx.strokeStyle = bad ? "#ff3b30" : "#ffe066";
+    ctx.beginPath(); ctx.moveTo(...P[a]); ctx.lineTo(...P[b]); ctx.stroke();
+  }
+  ctx.fillStyle = "#ffffff";
+  for (const p of Object.values(P)) { ctx.beginPath(); ctx.arc(p[0], p[1], ctx.lineWidth, 0, Math.PI * 2); ctx.fill(); }
+
+  // 著地瞬間：腳下閃一個圈
+  if (t < flashUntil) {
+    ctx.strokeStyle = "#00e5ff";
+    ctx.beginPath(); ctx.arc(P.ankle[0], P.ankle[1], w / 30, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+
+// 更新右側燈號與數值
+function updatePanel(evals) {
+  for (const e of evals) {
+    const row = $("row_" + e.key);
+    row.className = "row " + e.status;
+    row.querySelector(".val").textContent = e.display;
+  }
+  const cad = evals.find((e) => e.key === "cadence");
+  $("bigCad").innerHTML = (cad.value ? Math.round(cad.value) : "--") + "<small>步頻（步/分）</small>";
+}
+
+// ============================================================
+// 六、語音提示（手機內建的中文語音）
+// ============================================================
+function say(text) {
+  $("cueBox").textContent = "🔊 " + text;
+  if (!voiceOn || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();                       // 上一句還沒講完就直接換新的
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "zh-TW";
+  u.rate = 1.05;
+  speechSynthesis.speak(u);
+}
+
+// ============================================================
+// 七、節拍器（Web Audio：用排程的方式發聲，節拍才會準）
+// ============================================================
+let audioCtx = null, nextBeat = 0, metroTimer = null;
+
+function startMetronome() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  audioCtx.resume();
+  nextBeat = audioCtx.currentTime + 0.1;
+  metroTimer = setInterval(() => {
+    const interval = 60 / Number($("targetCad").value || 170);   // 每一步的秒數
+    // 提前 0.15 秒把接下來的拍子排好
+    while (nextBeat < audioCtx.currentTime + 0.15) {
+      const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+      osc.frequency.value = 1100;
+      gain.gain.setValueAtTime(0.6, nextBeat);
+      gain.gain.exponentialRampToValueAtTime(0.001, nextBeat + 0.05);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(nextBeat); osc.stop(nextBeat + 0.06);
+      nextBeat += interval;
+    }
+  }, 25);
+}
+function stopMetronome() { clearInterval(metroTimer); metroTimer = null; }
+
+// ============================================================
+// 八、錄影（錄原始畫面，之後可以丟給電腦版 run_form_v1.py 精準分析）
+// ============================================================
+let recorder = null, recChunks = [], recMime = "";
+
+function startRecording() {
+  recMime = ["video/mp4", "video/webm;codecs=vp9", "video/webm"].find((m) =>
+    window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || "";
+  if (!recMime) { alert("這支手機的瀏覽器不支援錄影"); return; }
+  recChunks = [];
+  recorder = new MediaRecorder(stream, { mimeType: recMime });
+  recorder.ondataavailable = (e) => { if (e.data.size) recChunks.push(e.data); };
+  recorder.start(1000);
+}
+function stopRecording() {
+  return new Promise((resolve) => {
+    if (!recorder) return resolve(null);
+    recorder.onstop = () => {
+      const blob = new Blob(recChunks, { type: recMime });
+      const ext = recMime.startsWith("video/mp4") ? "mp4" : "webm";
+      resolve({ url: URL.createObjectURL(blob), name: `run_${stamp()}.${ext}` });
+      recorder = null;
+    };
+    recorder.stop();
+  });
+}
+
+// ============================================================
+// 九、開始／停止
+// ============================================================
+let wakeLock = null;
+
+$("btnStart").onclick = async () => {
+  if (!running) {
+    analyzer.reset();
+    lastContactCount = 0; lastEvals = [];
+    running = true;
+    $("btnStart").textContent = "停止"; $("btnStart").className = "stop";
+    $("report").style.display = "none";
+    $("hint").textContent = "記錄中…先跑穩，約 12 秒後開始提示";
+    // 螢幕保持常亮（不然跑到一半手機會自動鎖定）
+    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) { /* 不支援就算了 */ }
+    say("開始記錄");                                // 手機規定要按按鈕後才能發聲，先講一句啟動語音
+    if (metroOn) startMetronome();
+    if (recOn) startRecording();
+  } else {
+    running = false;
+    $("btnStart").textContent = "開始跑步"; $("btnStart").className = "primary";
+    stopMetronome();
+    try { await wakeLock?.release(); } catch (e) {}
+    const rec = await stopRecording();
+    const s = analyzer.summary();
+    showReport(s, rec);
+    saveHistory(s);
+    say(s.topIssue ? `跑完了。最需要注意的是${s.topIssue.part}` : "跑完了，姿勢整體不錯");
+  }
+};
+
+// ---- 其他按鈕 ----
+$("btnVoice").onclick = () => {
+  voiceOn = !voiceOn;
+  $("btnVoice").textContent = "語音：" + (voiceOn ? "開" : "關");
+  $("btnVoice").classList.toggle("on", voiceOn);
+};
+$("btnMetro").onclick = () => {
+  metroOn = !metroOn;
+  $("btnMetro").textContent = "節拍器：" + (metroOn ? "開" : "關");
+  $("btnMetro").classList.toggle("on", metroOn);
+  if (metroOn) startMetronome(); else stopMetronome();   // 沒在跑也能先聽聽看速度
+};
+$("btnAutoTarget").onclick = () => {
+  const cad = lastEvals.find((e) => e.key === "cadence");
+  if (!cad || !cad.value) { alert("先跑一小段，量到步頻後再按"); return; }
+  // 研究常用的做法：一次只提高 5～10%
+  $("targetCad").value = Math.round(cad.value * 1.05);
+};
+$("btnRec").onclick = () => {
+  recOn = !recOn;
+  $("btnRec").textContent = "錄影：" + (recOn ? "開" : "關");
+  $("btnRec").classList.toggle("on", recOn);
+};
+$("btnCam").onclick = async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  await openCamera();
+};
+$("btnHistory").onclick = () => {
+  const el = $("history");
+  el.style.display = el.style.display === "block" ? "none" : "block";
+  if (el.style.display === "block") renderHistory();
+};
+
+// ============================================================
+// 十、跑完的報告
+// ============================================================
+function showReport(s, rec) {
+  const el = $("report");
+  const mins = Math.floor(s.durationSec / 60), secs = Math.round(s.durationSec % 60);
+  let html = `<h2>本次報告</h2>
+    <p>時間 ${mins} 分 ${secs} 秒｜約 ${s.steps} 步｜分析的腳：${s.side === "left" ? "左腳" : "右腳"}</p>
+    <table>${s.evals.map((e) =>
+      `<tr class="${e.status}"><td><span class="dot"></span>${e.part}</td><td>${e.display}</td>
+       <td>${e.status === "warn" ? "需注意" : e.status === "ok" ? "良好" : "資料不足"}</td></tr>`).join("")}
+    </table>`;
+  if (s.topIssue) {
+    html += `<h2 style="margin-top:12px">👉 最該先改：${s.topIssue.part}</h2>
+      <p>${s.topIssue.cue}</p>
+      <p>建議練習：</p><ul>${s.topIssue.drills.map((d) => `<li>${d}</li>`).join("")}</ul>`;
+    if (s.otherIssues.length) {
+      html += `<p class="note">其他需要注意（先把上面那一項練好再處理）：${s.otherIssues.map((o) => o.part).join("、")}</p>`;
+    }
+  } else if (s.steps > 10) {
+    html += `<p>👍 各項都在參考範圍內，保持下去！</p>`;
+  }
+  if (rec) html += `<p>📹 <a href="${rec.url}" download="${rec.name}">下載這次的錄影</a>（可以用電腦版 run_form_v1.py 做更精準的分析）</p>`;
+  html += `<p class="note">數值為單一鏡頭估計，僅供參考，不是醫療建議。</p>`;
+  el.innerHTML = html;
+  el.style.display = "block";
+  el.scrollIntoView({ behavior: "smooth" });
+}
+
+// ============================================================
+// 十一、歷次紀錄（存在這支手機的瀏覽器裡）
+// ============================================================
+const HKEY = "runform_history_v1";
+
+function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HKEY) || "[]"); } catch (e) { return []; }
+}
+function saveHistory(s) {
+  if (s.steps < 20) return;   // 太短的不存
+  const list = loadHistory();
+  list.push({ date: new Date().toISOString(), durationSec: Math.round(s.durationSec),
+              metrics: s.metrics, top: s.topIssue ? s.topIssue.part : null });
+  try { localStorage.setItem(HKEY, JSON.stringify(list.slice(-200))); } catch (e) { /* 無法儲存就略過 */ }
+}
+
+// 簡單的折線圖（SVG）
+function trendSvg(list, key, label, fmt) {
+  const pts = list.map((r) => r.metrics[key]).map((v, i) => [i, v]).filter((p) => p[1] !== null);
+  if (pts.length < 2) return `<p class="note">${label}：紀錄滿 2 次後會出現趨勢圖</p>`;
+  const W = 320, H = 110, pad = 28;
+  const ys = pts.map((p) => p[1]), min = Math.min(...ys), max = Math.max(...ys), span = (max - min) || 1;
+  const n = list.length - 1 || 1;
+  const xy = pts.map(([i, v]) => [pad + (W - 2 * pad) * i / n, H - pad - (H - 2 * pad) * (v - min) / span]);
+  return `<p style="margin:10px 0 2px">${label}</p>
+    <svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:480px;background:#151515;border-radius:6px">
+      <polyline fill="none" stroke="#4da3ff" stroke-width="2" points="${xy.map((p) => p.join(",")).join(" ")}"/>
+      ${xy.map((p, k) => `<circle cx="${p[0]}" cy="${p[1]}" r="3" fill="#4da3ff"/>`).join("")}
+      <text x="4" y="14" fill="#999" font-size="11">${fmt(max)}</text>
+      <text x="4" y="${H - 6}" fill="#999" font-size="11">${fmt(min)}</text>
+    </svg>`;
+}
+
+function renderHistory() {
+  const list = loadHistory();
+  const el = $("history");
+  if (!list.length) { el.innerHTML = "<h2>歷次紀錄</h2><p>還沒有紀錄。跑完一次就會自動存下來。</p>"; return; }
+  const f0 = (v) => v.toFixed(0), f2 = (v) => v.toFixed(2);
+  el.innerHTML = `<h2>歷次紀錄（共 ${list.length} 次）</h2>
+    ${trendSvg(list, "cadence", "步頻（步/分）— 往上比較好", f0)}
+    ${trendSvg(list, "overstride", "跨步程度（倍腿長）— 往下比較好", f2)}
+    ${trendSvg(list, "trunkLean", "軀幹前傾（度）", f0)}
+    <table style="margin-top:10px"><tr><td>日期</td><td>時間</td><td>步頻</td><td>最該改</td></tr>
+    ${list.slice().reverse().map((r) => `<tr><td>${new Date(r.date).toLocaleString("zh-TW", { hour12: false })}</td>
+      <td>${(r.durationSec / 60).toFixed(1)} 分</td>
+      <td>${r.metrics.cadence ? f0(r.metrics.cadence) : "--"}</td><td>${r.top || "—"}</td></tr>`).join("")}
+    </table>
+    <p><button id="btnClear">清除所有紀錄</button></p>`;
+  $("btnClear").onclick = () => {
+    if (confirm("確定要清除所有紀錄？")) { try { localStorage.removeItem(HKEY); } catch (e) {} renderHistory(); }
+  };
+}
+
+function stamp() {
+  const d = new Date(), p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+init();
+</script>
+</body>
+</html>
